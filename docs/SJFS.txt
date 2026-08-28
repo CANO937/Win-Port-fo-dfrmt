@@ -1,0 +1,177 @@
+---- SJFS
+
+SJFS (Simple Journaled FileSystem) nasce come un ibrido storico tra HPFS e BFS
+ed è progettato per kernel moderni, NVMe/SATA e dispositivi USB. Unisce la gestione
+del Journaling di BFS (BeOS) con le bande di allocazione di HPFS (OS/2) eliminando i 
+vincoli di compatibilità POSIX/Unix tradizionali.
+
+Il blocco logico (BL) è l'unità minima indivisibile di allocazione dello spazio, 
+indirizzamento I/O e gestione della memoria per SJFS. In questo caso è di 4096B (4KB)
+poiché allineato alla Page Cache della memoria virtuale di x86_64.
+
+L'allocazione dello spazio è basata su extents dinamici (estensioni di blocchi contigui)
+allineati allo stile EXT4/NTFS per minimizzare e prevenire la frammentazione evitando 
+ogni spreco di memoria e pre-allocazioni vuote su disco.
+
+Il layout fisico del disco è suddiviso in bande di allocazione da 64MB a 512MB ciascuna,
+ogni banda è dotata di bitmap locale.
+
+Write Ahead Logic dedicato esclusivamente ai Metadati:
++-----------------------------------------------------------------------------------+
+| 1. RECORD LOG      : Scrittura della transazione nell'area circolare WAL (Journal)|
++-----------------------------------------------------------------------------------+
+                                         |
+                                         v
++-----------------------------------------------------------------------------------+
+| 2. COMMIT LOG      : Scrittura del marcatore di "Transazione Conclusa"            |
++-----------------------------------------------------------------------------------+
+                                         |
+                                         v
++-----------------------------------------------------------------------------------+
+| 3. CHECKPOINTING   : Applicazione reale delle modifiche alle strutture fisiche    |
++-----------------------------------------------------------------------------------+
+
+Metadati: Organizzazione delle directory via B+Tree e supporto ad Attributi Key-Value 
+arbitrari associati ai file.
+
+--------------------------------------------------------------
+
+---- Disk Geometry
+
+La Geometria del disco indica com'è una partizione SJFS, in questo caso è suddivisa in 4
+regioni fisiche principali e sequenziali:
++---------------------------------------------------------------------------------------+
+|  Sector 0-7  |   Block 1 - N   |      Block N+1       |     Block N+2 ... Fine Disco  |
+|              |                 |                      |                               |
+|  Superblock  | Metadata Log    | Allocation Band 0    | Allocation Band 1 ... N       |
+|   (4 KB)     |  (WAL Journal)  | Header + Bitmap      | Header + Bitmap               |
+|              |  (es. 16-64 MB) | + Central Dir Head   | + Data Blocks                 |
++---------------------------------------------------------------------------------------+
+
+- Superblock (Offset 0x00): Il blocco 0 (4 KB) della partizione contiene le informazioni globali 
+  di montaggio.
+
+- Journal Area (WAL): Un'area circolare riservata ai record di transazione 
+  prima di committare i metadati su disco.
+
+- Allocation Bands (Bande di Allocazione): Il resto del disco è diviso in segmenti di dimensione fissa.
+  Ciascuna banda contiene: 
+  
+  Band Header & Local Bitmap: Stato d'occupazione dei blocchi della singola banda.
+  Central Directory Head: Nodo radice o locali per minimizzare i tempi di seek.
+  Data Blocks: Spazio dedicato ai dati dei file e nodi B+Tree.
+
+
+                  [ Apertura File / Doppio Clic ]
+                                │
+                                ▼
+               [ Leggi Attributo TYPE in JSFS ]
+                                │
+         ┌──────────────────────┴──────────────────────┐
+         ▼                                             ▼
+[ TYPE != 2345/1 ]                            [ TYPE == 0000/0   ]
+  (Hash Valido)                                (Sconosciuto / Legacy)
+         │                                             │
+         ▼                                             ▼
+  Usa Categoria &                             Leggi Estensione del Nome
+  Trova App associata                        (es. ".xyz") via Fallback
+         │                                             │
+         └──────────────────────┬──────────────────────┘
+                                │
+                                ▼
+                     [ Controlla OPENWITH ]
+                                │
+         ┌──────────────────────┴──────────────────────┐
+         ▼                                             ▼
+ [ OPENWITH presente ]                         [ OPENWITH vuoto ]
+  Apre direttamente                             Mostra Dialogo Utente:
+  l'app (es. imageviewer)                       "Con quale app aprire?"
+                                                       │
+                                                       ▼
+                                            Salva scelta utente in
+                                            OPENWITH per la prossima volta
+
+
+
+================================================================================
+          ARCHITETTURA ARCHIVIAZIONE E METADATI JSFS (VFS & FILESYSTEM)
+================================================================================
+
+1. STRUTTURA DEGLI ATTRIBUTI ESTESI DEL FILE (METADATA HEADER)
+--------------------------------------------------------------------------------
+Ogni file/nodo in JSFS gestisce l'identificazione e l'associazione tramite 
+attributi estesi compatti basati su valori numerici e riferimenti a tabelle.
+
+Campi principali dell'attributo:
+  - TYPE     : <HASH_ESTENSIONE> / <ID_CATEGORIA>
+  - OPENWITH : <ID_TABELLA> / <OFFSET_STRINGA>
+
+--------------------------------------------------------------------------------
+2. FORMATO DEL CAMPO 'TYPE' (es. 1616 / 1 oppure 0000 / 0)
+--------------------------------------------------------------------------------
+Parte 1: HASH_ESTENSIONE (32-bit uint / Deterministico FNV-1a)
+  - Calcolato sulla stringa dell'estensione (es. "jpg" -> 1616, "c" -> 2048).
+  - Permette confronti O(1) nel kernel senza strcmp().
+  - Valore '0000' indica file privo di estensione / Generico (GF).
+
+Parte 2: ID_CATEGORIA (Enum Macro-Gruppo)
+  - 0 = Generico / Sconosciuto (GF)
+  - 1 = Immagini / Media
+  - 2 = Eseguibili / Binari (.xct, .xcm)
+  - 3 = Codice Sorgente / Testo
+
+--------------------------------------------------------------------------------
+3. FORMATO DEL CAMPO 'OPENWITH' (es. 1 / 10 oppure 2 / 35)
+--------------------------------------------------------------------------------
+Parte 1: ID_TABELLA (Sorgente della Stringa)
+  - Tabella 1 = Tabella di Sistema (In RAM / Read-Only al Boot)
+  - Tabella 2 = Tabella del Volume/Disco (JSFS Superblock / Dinamica)
+
+Parte 2: OFFSET_STRINGA (Pointer a 24/32-bit)
+  - Offset in byte all'interno della String Table selezionata dove si trova
+    il percorso 'null-terminated' dell'applicazione associata.
+
+Esempi:
+  - OPENWITH = 1 / 10  -> Usa Tabella 1 (Sistema), offset 10 ("system/bin/viewer.xcm")
+  - OPENWITH = 2 / 35  -> Usa Tabella 2 (Disco), offset 35 ("home/user/apps/custom.xct")
+  - OPENWITH = vuoto   -> Chiede all'utente l'app da associare e aggiorna l'attributo.
+
+--------------------------------------------------------------------------------
+4. FLUSSO DI RISOLUZIONE APERTURA FILE NEL VFS
+--------------------------------------------------------------------------------
+[Apertura File]
+       │
+       ├─► Check TYPE:
+       │     ├─ TYPE != 0000/0 : Identificato tramite Hash (Istantaneo).
+       │     └─ TYPE == 0000/0 : File Generico (GF). Tenta lettura estensione nel nome.
+       │
+       └─► Check OPENWITH:
+             ├─ Valore Presente : Risolve <ID_TABELLA>/<OFFSET> ed esegue l'app.
+             └─ Valore Vuoto    : Mostra dialogo d'associazione utente. 
+                                  In caso di selezione, salva il nuovo valore in 
+                                  OPENWITH (se app custom, scrive in Tabella 2).
+
+--------------------------------------------------------------------------------
+5. VANTAGGI DELL'ARCHITETTURA
+--------------------------------------------------------------------------------
+1. Zero Frammentazione RAM: Nessuna allocazione dinamica (kmalloc) per leggere 
+   i tipi e i percorsi delle app di sistema.
+2. Metadati Compatti: Gli Inode occupano pochi byte su disco grazie ai riferimenti 
+   interi (32-bit).
+3. Piena Convertibilità: Mantiene il nome completo (con estensione) consentendo 
+   l'import/export trasparente con EXT4, NTFS e FAT32.
+
+
+strtuttura delle cartelle:
+
+D:A -> Disco di sistema, identificato come "BASE" o --/
+D:B...D:Z -> Dischi/MemorieFlash etc etc
+|
+D (= Drive) : Lettera
+
+se è una partizione di un disco si sicrive:
+D:B-P:NomePartizione
+
+le partizioni della base si scrivono D:A-P:NomePartizione
+con l'eccezione per la partizione di sistema che viene oscurata
+e la partizione user chè è indicata con --/
