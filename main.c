@@ -19,26 +19,6 @@
 #define SECTOR_SIZE 512
 #include <winioctl.h>
 
-typedef struct {
-    UINT64 sizeMB;        // Dimensione in MB (0 = usa tutto lo spazio rimanente)
-    CHAR8 fsType[16];     // "exfat", "sjfs", ecc.
-    CHAR16 name[36];     // Nome GPT (es. L"Data1", L"Data2")
-    UINT64 startLba;      // Calcolato dinamicamente
-    UINT64 sectorCount;   // Calcolato dinamicamente
-} PARTITION_CONFIG;
-
-BOOLEAN DismountAndLockVolume(HANDLE hDisk) {
-    DWORD bytesReturned;
-    
-    DeviceIoControl(hDisk, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &bytesReturned, NULL);
-    DeviceIoControl(hDisk, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0, &bytesReturned, NULL);
-
-    if (!DeviceIoControl(hDisk, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, &bytesReturned, NULL)) {
-        DeviceIoControl(hDisk, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0, &bytesReturned, NULL);
-    }
-
-    return TRUE;
-}
 UINT32 CalculateCRC32(const void* data, size_t size) {
     UINT32 crc = 0xFFFFFFFF;
     const UINT8* p = (const UINT8*)data;
@@ -150,39 +130,52 @@ UINT32 CalculateUpcaseChecksum(const UINT8* data, size_t size) {
     }
     return checksum;
 }
-
-BOOLEAN CreateGptPartition(HANDLE hDisk, UINT64* outStartLba, UINT64* outSectorCount) {
-    UINT32 sectorSize = 0;
-    UINT64 totalSectors = 0;
-    UINT64 diskSizeBytes = 0;
-
-    if (!GetDiskGeometryInfo(hDisk, &sectorSize, &totalSectors, &diskSizeBytes)) {
-        printf("Errore: Impossibile leggere la geometria del disco.\n");
-        return FALSE;
+UINT64 ParseSizeToSectors(const char* inputStr, UINT32 sectorSize, UINT64 maxAvailableSectors) {
+    if (_stricmp(inputStr, "max") == 0 || strcmp(inputStr, "0") == 0) {
+        return maxAvailableSectors;
     }
 
-    printf("Informazioni Disco:\n");
-    printf(" - Dimensione settore: %u Byte\n", sectorSize);
-    printf(" - Settori totali     : %llu\n", totalSectors);
+    double val = 0;
+    char unit[16] = { 0 };
 
-    UINT64 alignmentSectors = (1024 * 1024) / sectorSize;
-    UINT64 startLba = alignmentSectors; 
-    UINT64 endLba = totalSectors - 35;
-
-    if (startLba >= endLba) {
-        printf("Errore: Disco troppo piccolo per ospitare una partizione GPT.\n");
-        return FALSE;
+    if (sscanf(inputStr, "%lf%15s", &val, unit) < 1) {
+        return 0;
     }
 
-    *outStartLba = startLba;
-    *outSectorCount = (endLba - startLba + 1);
+    UINT64 bytes = 0;
+    if (_stricmp(unit, "GB") == 0 || _stricmp(unit, "G") == 0) {
+        bytes = (UINT64)(val * 1024 * 1024 * 1024);
+    } else if (_stricmp(unit, "MB") == 0 || _stricmp(unit, "M") == 0) {
+        bytes = (UINT64)(val * 1024 * 1024);
+    } else if (_stricmp(unit, "KB") == 0 || _stricmp(unit, "K") == 0) {
+        bytes = (UINT64)(val * 1024);
+    } else if (_stricmp(unit, "B") == 0 || strlen(unit) == 0) {
+        bytes = (UINT64)val;
+    } else {
+        printf("Unità non riconosciuta: %s. Usa B, KB, MB, GB o MAX.\n", unit);
+        return 0;
+    }
 
-
+    UINT64 sectors = bytes / sectorSize;
+    if (sectors > maxAvailableSectors) {
+        sectors = maxAvailableSectors;
+    }
+    return sectors;
+}
+BOOLEAN ReadSectors(HANDLE hDisk, UINT64 lba, UINT32 sectorCount, void* buffer) {
+    DWORD bytesRead = 0;
+    LARGE_INTEGER offset;
+    offset.QuadPart = lba * SECTOR_SIZE;
+    if (!SetFilePointerEx(hDisk, offset, NULL, FILE_BEGIN)) return FALSE;
+    DWORD bytesToRead = sectorCount * SECTOR_SIZE;
+    return ReadFile(hDisk, buffer, bytesToRead, &bytesRead, NULL) && (bytesRead == bytesToRead);
+}
+BOOLEAN CreateEmptyGpt(HANDLE hDisk, UINT64 totalSectors) {
     ProtectiveMbr pMBR;
     memset(&pMBR, 0, sizeof(ProtectiveMbr));
     pMBR.partitions[0].boot_indicator = 0x00;
     pMBR.partitions[0].starting_chs[1] = 0x01;
-    pMBR.partitions[0].os_type = 0xEE;
+    pMBR.partitions[0].os_type = 0xEE; // GPT Protective
     pMBR.partitions[0].ending_chs[0] = 0xFF;
     pMBR.partitions[0].ending_chs[1] = 0xFF;
     pMBR.partitions[0].ending_chs[2] = 0xFF;
@@ -193,30 +186,20 @@ BOOLEAN CreateGptPartition(HANDLE hDisk, UINT64* outStartLba, UINT64* outSectorC
 
     if (!WriteProtectiveMBR(hDisk, &pMBR)) return FALSE;
 
-    GPT_ENTRY entries[128];
-    memset(entries, 0, sizeof(entries));
-    static const UINT8 GUID_BASIC_DATA[16] = { 0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7 };
-    memcpy(entries[0].PartitionTypeGUID, GUID_BASIC_DATA, 16);
-    CoCreateGuid((GUID*)entries[0].UniquePartitionGUID);
-    entries[0].StartingLBA = startLba;
-    entries[0].EndingLBA = endLba;
-    entries[0].Attributes = 0;
-    const wchar_t* partName = L"Basic Data";
-    wcsncpy((wchar_t*)entries[0].PartitionName, partName, 36);
+    GPT_ENTRY emptyEntries[128];
+    memset(emptyEntries, 0, sizeof(emptyEntries));
 
-    UINT32 entriesCRC32 = CalculateCRC32(entries, sizeof(entries));
+    UINT32 entriesCRC32 = CalculateCRC32(emptyEntries, sizeof(emptyEntries));
+    if (!WriteGptEntries(hDisk, 2, emptyEntries)) return FALSE;
 
-    if (!WriteGptEntries(hDisk, 2, entries)) return FALSE;
     UINT64 backupEntriesLba = totalSectors - 33;
-    if (!WriteGptEntries(hDisk, backupEntriesLba, entries)) return FALSE;
+    if (!WriteGptEntries(hDisk, backupEntriesLba, emptyEntries)) return FALSE;
 
     GPT_HEADER primaryHeader;
     memset(&primaryHeader, 0, sizeof(GPT_HEADER));
     memcpy(primaryHeader.Signature, "EFI PART", 8);
     primaryHeader.Revision = 0x00010000;
     primaryHeader.HeaderSize = sizeof(GPT_HEADER);
-    primaryHeader.HeaderCRC32 = 0;
-    primaryHeader.Reserved = 0;
     primaryHeader.CurrentLBA = 1;
     primaryHeader.BackupLBA = totalSectors - 1;
     primaryHeader.FirstUsableLBA = 34;
@@ -241,6 +224,7 @@ BOOLEAN CreateGptPartition(HANDLE hDisk, UINT64* outStartLba, UINT64* outSectorC
 
     return TRUE;
 }
+
 BOOLEAN FormatExfat(HANDLE hDisk, UINT64 startLba, UINT64 sectorCount, CHAR16 volumeName[11]) {
     printf("[exFAT] Avvio formattazione a LBA %llu (%llu settori)...\n", startLba, sectorCount);
 
@@ -381,47 +365,6 @@ BOOLEAN FormatExfat(HANDLE hDisk, UINT64 startLba, UINT64 sectorCount, CHAR16 vo
     return TRUE;
 }
 
-
-UINT64 ParseSizeToSectors(const char* inputStr, UINT32 sectorSize, UINT64 maxAvailableSectors) {
-    if (_stricmp(inputStr, "max") == 0 || strcmp(inputStr, "0") == 0) {
-        return maxAvailableSectors;
-    }
-
-    double val = 0;
-    char unit[16] = { 0 };
-
-    if (sscanf(inputStr, "%lf%15s", &val, unit) < 1) {
-        return 0;
-    }
-
-    UINT64 bytes = 0;
-    if (_stricmp(unit, "GB") == 0 || _stricmp(unit, "G") == 0) {
-        bytes = (UINT64)(val * 1024 * 1024 * 1024);
-    } else if (_stricmp(unit, "MB") == 0 || _stricmp(unit, "M") == 0) {
-        bytes = (UINT64)(val * 1024 * 1024);
-    } else if (_stricmp(unit, "KB") == 0 || _stricmp(unit, "K") == 0) {
-        bytes = (UINT64)(val * 1024);
-    } else if (_stricmp(unit, "B") == 0 || strlen(unit) == 0) {
-        bytes = (UINT64)val;
-    } else {
-        printf("Unità non riconosciuta: %s. Usa B, KB, MB, GB o MAX.\n", unit);
-        return 0;
-    }
-
-    UINT64 sectors = bytes / sectorSize;
-    if (sectors > maxAvailableSectors) {
-        sectors = maxAvailableSectors;
-    }
-    return sectors;
-}
-BOOLEAN ReadSectors(HANDLE hDisk, UINT64 lba, UINT32 sectorCount, void* buffer) {
-    DWORD bytesRead = 0;
-    LARGE_INTEGER offset;
-    offset.QuadPart = lba * SECTOR_SIZE;
-    if (!SetFilePointerEx(hDisk, offset, NULL, FILE_BEGIN)) return FALSE;
-    DWORD bytesToRead = sectorCount * SECTOR_SIZE;
-    return ReadFile(hDisk, buffer, bytesToRead, &bytesRead, NULL) && (bytesRead == bytesToRead);
-}
 BOOLEAN AddPartitionToGpt(HANDLE hDisk, const CHAR8* fsType, const char* sizeStr, const wchar_t* partName) {
     UINT32 sectorSize = 0;
     UINT64 totalSectors = 0;
@@ -431,7 +374,6 @@ BOOLEAN AddPartitionToGpt(HANDLE hDisk, const CHAR8* fsType, const char* sizeStr
         return FALSE;
     }
 
-    // 1. Leggi l'Header GPT Primario dall'LBA 1
     BYTE headerBuf[SECTOR_SIZE];
     if (!ReadSectors(hDisk, 1, 1, headerBuf)) {
         printf("Errore lettura Header GPT.\n");
@@ -443,15 +385,13 @@ BOOLEAN AddPartitionToGpt(HANDLE hDisk, const CHAR8* fsType, const char* sizeStr
         return FALSE;
     }
 
-    // 2. Leggi le 128 voci della tabella GPT (LBA 2..33)
     GPT_ENTRY entries[128];
     if (!ReadSectors(hDisk, 2, 32, entries)) {
         printf("Errore lettura voci GPT.\n");
         return FALSE;
     }
 
-    // 3. Trova l'ultimo LBA occupato e il primo slot vuoto nella tabella
-    UINT64 highestLbaUsed = 2047; // Default: prima del primo settore utile (LBA 2048)
+    UINT64 highestLbaUsed = 2047;
     int freeSlotIndex = -1;
 
     static const UINT8 ZERO_GUID[16] = { 0 };
@@ -462,7 +402,7 @@ BOOLEAN AddPartitionToGpt(HANDLE hDisk, const CHAR8* fsType, const char* sizeStr
                 highestLbaUsed = entries[i].EndingLBA;
             }
         } else if (freeSlotIndex == -1) {
-            freeSlotIndex = i; // Primo slot libero trovato
+            freeSlotIndex = i;
         }
     }
 
@@ -471,7 +411,6 @@ BOOLEAN AddPartitionToGpt(HANDLE hDisk, const CHAR8* fsType, const char* sizeStr
         return FALSE;
     }
 
-    // 4. Calcola il nuovo LBA d'inizio allineato a 1 MB (2048 settori)
     UINT64 alignmentSectors = (1024 * 1024) / sectorSize;
     UINT64 newStartLba = (highestLbaUsed + 1 + alignmentSectors - 1) & ~(alignmentSectors - 1);
     UINT64 lastUsableLba = header->LastUsableLBA;
@@ -493,7 +432,6 @@ BOOLEAN AddPartitionToGpt(HANDLE hDisk, const CHAR8* fsType, const char* sizeStr
     printf("[GPT] Nuova partizione #%d: LBA %llu -> %llu (%llu MB)\n", 
            freeSlotIndex + 1, newStartLba, newEndLba, (requestedSectors * sectorSize) / (1024 * 1024));
 
-    // 5. Formattazione File System SOLO nei settori della nuova partizione
     printf("[1/2] Formattazione File System (%s)...\n", fsType);
     if (strcmp(fsType, "exfat") == 0) {
         if (!FormatExfat(hDisk, newStartLba, requestedSectors, (CHAR16*)partName)) {
@@ -505,7 +443,6 @@ BOOLEAN AddPartitionToGpt(HANDLE hDisk, const CHAR8* fsType, const char* sizeStr
         return FALSE;
     }
 
-    // 6. Aggiorna la voce nell'array GPT
     static const UINT8 GUID_BASIC_DATA[16] = {
         0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 
         0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7
@@ -517,19 +454,16 @@ BOOLEAN AddPartitionToGpt(HANDLE hDisk, const CHAR8* fsType, const char* sizeStr
     entries[freeSlotIndex].Attributes = 0;
     wcsncpy((wchar_t*)entries[freeSlotIndex].PartitionName, partName, 36);
 
-    // 7. Ricalcola CRC32 dell'array di voci e degli Header GPT
     UINT32 entriesCRC32 = CalculateCRC32(entries, sizeof(entries));
 
     header->PartitionEntryArrayCRC32 = entriesCRC32;
     header->HeaderCRC32 = 0;
     header->HeaderCRC32 = CalculateCRC32(header, sizeof(GPT_HEADER));
 
-    // 8. Scrittura GPT Tabella Voci e Header Primario
     printf("[2/2] Aggiornamento Tabella GPT...\n");
     WriteGptEntries(hDisk, 2, entries);
     WriteGptHeader(hDisk, 1, header);
 
-    // 9. Scrittura GPT Backup
     UINT64 backupEntriesLba = totalSectors - 33;
     WriteGptEntries(hDisk, backupEntriesLba, entries);
 
@@ -541,67 +475,8 @@ BOOLEAN AddPartitionToGpt(HANDLE hDisk, const CHAR8* fsType, const char* sizeStr
     backupHeader.HeaderCRC32 = CalculateCRC32(&backupHeader, sizeof(GPT_HEADER));
     WriteGptHeader(hDisk, totalSectors - 1, &backupHeader);
 
-    // 10. Notifica finale a Windows
     DWORD dummy;
     DeviceIoControl(hDisk, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &dummy, NULL);
-
-    return TRUE;
-}
-BOOLEAN CreateEmptyGpt(HANDLE hDisk, UINT64 totalSectors) {
-    // 1. Protective MBR (LBA 0)
-    ProtectiveMbr pMBR;
-    memset(&pMBR, 0, sizeof(ProtectiveMbr));
-    pMBR.partitions[0].boot_indicator = 0x00;
-    pMBR.partitions[0].starting_chs[1] = 0x01;
-    pMBR.partitions[0].os_type = 0xEE; // GPT Protective
-    pMBR.partitions[0].ending_chs[0] = 0xFF;
-    pMBR.partitions[0].ending_chs[1] = 0xFF;
-    pMBR.partitions[0].ending_chs[2] = 0xFF;
-    pMBR.partitions[0].starting_lba = 1;
-    UINT64 mbrSectors = totalSectors - 1;
-    pMBR.partitions[0].size_in_lba = (mbrSectors > 0xFFFFFFFF) ? 0xFFFFFFFF : (UINT32)mbrSectors;
-    pMBR.boot_signature = 0xAA55;
-
-    if (!WriteProtectiveMBR(hDisk, &pMBR)) return FALSE;
-
-    // 2. Voci GPT vuote (LBA 2..33)
-    GPT_ENTRY emptyEntries[128];
-    memset(emptyEntries, 0, sizeof(emptyEntries));
-
-    UINT32 entriesCRC32 = CalculateCRC32(emptyEntries, sizeof(emptyEntries));
-    if (!WriteGptEntries(hDisk, 2, emptyEntries)) return FALSE;
-
-    UINT64 backupEntriesLba = totalSectors - 33;
-    if (!WriteGptEntries(hDisk, backupEntriesLba, emptyEntries)) return FALSE;
-
-    // 3. Primary Header GPT (LBA 1)
-    GPT_HEADER primaryHeader;
-    memset(&primaryHeader, 0, sizeof(GPT_HEADER));
-    memcpy(primaryHeader.Signature, "EFI PART", 8);
-    primaryHeader.Revision = 0x00010000;
-    primaryHeader.HeaderSize = sizeof(GPT_HEADER);
-    primaryHeader.CurrentLBA = 1;
-    primaryHeader.BackupLBA = totalSectors - 1;
-    primaryHeader.FirstUsableLBA = 34;
-    primaryHeader.LastUsableLBA = totalSectors - 35;
-    CoCreateGuid((GUID*)primaryHeader.DiskGUID);
-    primaryHeader.PartitionEntryLBA = 2;
-    primaryHeader.NumberOfPartitionEntries = 128;
-    primaryHeader.SizeOfPartitionEntry = sizeof(GPT_ENTRY);
-    primaryHeader.PartitionEntryArrayCRC32 = entriesCRC32;
-    primaryHeader.HeaderCRC32 = CalculateCRC32(&primaryHeader, sizeof(GPT_HEADER));
-
-    if (!WriteGptHeader(hDisk, 1, &primaryHeader)) return FALSE;
-
-    // 4. Backup Header GPT (Ultimo LBA)
-    GPT_HEADER backupHeader = primaryHeader;
-    backupHeader.CurrentLBA = totalSectors - 1;
-    backupHeader.BackupLBA = 1;
-    backupHeader.PartitionEntryLBA = backupEntriesLba;
-    backupHeader.HeaderCRC32 = 0;
-    backupHeader.HeaderCRC32 = CalculateCRC32(&backupHeader, sizeof(GPT_HEADER));
-
-    if (!WriteGptHeader(hDisk, totalSectors - 1, &backupHeader)) return FALSE;
 
     return TRUE;
 }
