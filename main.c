@@ -387,13 +387,11 @@ BOOLEAN FormatExfat(HANDLE hDisk, UINT64 startLba, UINT64 sectorCount, CHAR16 vo
     printf("[exFAT] Scrittura metadati completata con successo.\n");
     return TRUE;
 }
-
 BOOLEAN FormatSjfs(HANDLE hDisk, UINT64 startLba, UINT64 sectorCount, UINT8 bands, const CHAR8 *name) {
     printf("[SJFS] Avvio formattazione a LBA %llu (%llu settori)...\n", startLba, sectorCount);
 
-    UINT32 sectorsPerBlock = BLOCK_SIZE / 512; // 8 settori per blocco (4KB)
+    UINT32 sectorsPerBlock = BLOCK_SIZE / 512;
 
-    // 1. Azzeramento dei primi 256 settori (128 KB) per pulizia iniziale
     UINT8 zeroSector[512] = { 0 };
     for (UINT64 i = 0; i < 256; i++) {
         if (!WriteSectors(hDisk, startLba + i, 1, zeroSector)) {
@@ -402,12 +400,10 @@ BOOLEAN FormatSjfs(HANDLE hDisk, UINT64 startLba, UINT64 sectorCount, UINT8 band
         }
     }
 
-    // 2. Validazione dimensione bande (MB)
-    if (bands != 8 && bands != 16 && bands != 32 && bands != 64) {
-        bands = 16; // Default a 64 MB
+    if (bands != 16 && bands != 32 && bands != 64 && bands != 128) {
+        bands = 32; // Default a 64 MB
     }
 
-    // 3. Configurazione del Superblock
     UINT8 superBlockBuffer[BLOCK_SIZE];
     memset(superBlockBuffer, 0, sizeof(superBlockBuffer));
 
@@ -423,9 +419,8 @@ BOOLEAN FormatSjfs(HANDLE hDisk, UINT64 startLba, UINT64 sectorCount, UINT8 band
     supblk->BlockSize = BLOCK_SIZE;
 
     supblk->TotalBlocks = (sectorCount * 512) / BLOCK_SIZE;
-    supblk->JournalStart = 1; // Inizia subito dopo il Superblock
+    supblk->JournalStart = 1; 
 
-    // WAL Journal: 32 MB di default (max 5% della partizione)
     UINT64 journalBytes = 32ULL * 1024 * 1024;
     UINT64 journalBlocks = journalBytes / BLOCK_SIZE;
     if (journalBlocks > (supblk->TotalBlocks / 20)) {
@@ -435,11 +430,9 @@ BOOLEAN FormatSjfs(HANDLE hDisk, UINT64 startLba, UINT64 sectorCount, UINT8 band
 
     supblk->BandSizeInBytes = (UINT64)bands * 1024 * 1024;
 
-    // Offset String Table del Disco
     supblk->DiskStartTableOffset = 512;
     supblk->DiskStartTableSize = 1024;
 
-    // 4. Calcolo dimensioni bande e numero blocchi di Header/Bitmap
     UINT64 journalEndBlock = supblk->JournalStart + supblk->JournalBlocks;
     UINT64 band0StartLba = startLba + (journalEndBlock * sectorsPerBlock);
 
@@ -447,29 +440,22 @@ BOOLEAN FormatSjfs(HANDLE hDisk, UINT64 startLba, UINT64 sectorCount, UINT8 band
     UINT64 usableBlocks = (supblk->TotalBlocks > journalEndBlock) ? (supblk->TotalBlocks - journalEndBlock) : 0;
     UINT64 totalBands = usableBlocks / blocksPerBand;
 
-    // CALCOLO DINAMICO DIMENSIONE BITMAP:
-    // 1 bit per blocco -> (blocksPerBand + 7) / 8 byte
     UINT32 bitmapBytes = (blocksPerBand + 7) / 8;
     UINT32 totalBandHeaderBytes = sizeof(BAND_HEADER) + bitmapBytes;
     
-    // Quanti blocchi occorrono per contenere Header + Bitmap?
     UINT32 headerBlocks = (totalBandHeaderBytes + BLOCK_SIZE - 1) / BLOCK_SIZE;
     UINT32 headerSectors = headerBlocks * sectorsPerBlock;
 
-    // La Root Directory si trova subito dopo i blocchi di Header/Bitmap della Banda 0
     supblk->RootExtentLba = band0StartLba + headerSectors;
 
-    // Scrittura Superblock (Blocco 0)
     if (!WriteSectors(hDisk, startLba, sectorsPerBlock, superBlockBuffer)) {
         printf("[SJFS] Errore durante la scrittura del Superblock!\n");
         return FALSE;
     }
 
-    // 5. Inizializzazione di ciascuna Allocation Band
     printf("[SJFS] Inizializzazione di %llu bande (%u MB ciascuna, Header = %u blocchi)...\n", 
            totalBands, bands, headerBlocks);
 
-    // Buffer dinamico locale per contenere l'Header esteso della banda (max 32KB per 512MB)
     UINT8 bandBuffer[32 * 1024]; 
 
     for (UINT64 i = 0; i < totalBands; i++) {
@@ -485,12 +471,10 @@ BOOLEAN FormatSjfs(HANDLE hDisk, UINT64 startLba, UINT64 sectorCount, UINT8 band
         UINT8* bitmap = bandBuffer + bandHeader->BitmapOffsetBytes;
 
         if (i == 0) {
-            // Banda 0: Occupa gli headerBlocks + 1 blocco per il Nodo Radice della Root Directory
             bandHeader->CentralDirHead = supblk->RootExtentLba;
             bandHeader->FreeBlocks = blocksPerBand - (headerBlocks + 1);
             MarkBitmapBits(bitmap, headerBlocks + 1);
         } else {
-            // Bande 1..N-1: Occupano solo gli headerBlocks
             bandHeader->CentralDirHead = 0;
             bandHeader->FreeBlocks = blocksPerBand - headerBlocks;
             MarkBitmapBits(bitmap, headerBlocks);
@@ -502,12 +486,11 @@ BOOLEAN FormatSjfs(HANDLE hDisk, UINT64 startLba, UINT64 sectorCount, UINT8 band
         }
     }
 
-    // 6. Inizializzazione del Nodo Radice del B+Tree (Root Directory /)
     UINT8 rootNodeBuffer[BLOCK_SIZE];
     memset(rootNodeBuffer, 0, sizeof(rootNodeBuffer));
 
     SJFS_BTREE_NODE* rootNode = (SJFS_BTREE_NODE*)rootNodeBuffer;
-    rootNode->NodeType = 0x0001; // Nodo Radice / Foglia
+    rootNode->NodeType = 0x0001;
     rootNode->KeyCount = 0;
     rootNode->Reserved = 0;
     rootNode->ParentNodeLba = 0;
@@ -661,7 +644,7 @@ INT32 main() {
     char driveSelected = 0;
 
     printf("====================================================\n");
-    printf("     DFRMT - Disk Partition & SJFS Formatting Tool   \n");
+    printf("     DFRMT - Disk Partitioner                       \n");
     printf("====================================================\n");
 
     while (1) {
@@ -761,13 +744,13 @@ INT32 main() {
                 continue;
             }
 
-            UINT8 bandSizeMb = 16; // Default per SJFS
+            UINT8 bandSizeMb = 32; // Default per SJFS
             if (strcmp(fs, "sjfs") == 0) {
-                printf("dfrmt >>> [SJFS Band Size MB (8, 16, 32, 64)] ");
-                char bandBuf[16];
+                printf("dfrmt >>> [SJFS Band Size MB (16, 32, 64, 128)] ");
+                char bandBuf[32];
                 if (scanf("%15s", bandBuf) == 1) {
                     UINT8 val = (UINT8)atoi(bandBuf);
-                    if (val == 8 || val == 16 || val == 32 || val == 64) {
+                    if (val == 16 || val == 32 || val == 64 || val == 128) {
                         bandSizeMb = val;
                     } else {
                         printf("[SJFS] Dimensione banda non valida. Utilizzo del default (64 MB).\n");
