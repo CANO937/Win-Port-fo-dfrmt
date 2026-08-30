@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
+#include <time.h>
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
@@ -14,11 +15,29 @@
 #include <types.h>
 #include <gpt.h>
 #include <FS/exFAT.h>
+#include <FS/SJFS.h>
 #include <mbr.h>
 
 #define SECTOR_SIZE 512
 #include <winioctl.h>
 
+UINT64 Fnv1a64(const CHAR8 *str) {
+    const UINT64 FNV_prime = 0x100000001B3ULL;
+    const UINT64 FNV_offset_basis = 0xcbf29ce484222325ULL;
+    
+    UINT64 hash = FNV_offset_basis;
+
+    while (*str) {
+        hash ^= (UINT8)*str;
+        hash *= FNV_prime;
+        str++;
+    }
+
+    return hash;
+}
+time_t GetTimestamp(void) {
+    return time(NULL);
+}
 UINT32 CalculateCRC32(const void* data, size_t size) {
     UINT32 crc = 0xFFFFFFFF;
     const UINT8* p = (const UINT8*)data;
@@ -92,7 +111,6 @@ BOOLEAN WriteProtectiveMBR(HANDLE hDisk, const ProtectiveMbr* pMBR) {
     BYTE sectorBuffer[SECTOR_SIZE] = { 0 };
 
     memcpy(sectorBuffer, pMBR, sizeof(ProtectiveMbr));
-
     return WriteSectors(hDisk, 0, 1, sectorBuffer);
 }
 BOOLEAN WriteGptEntries(HANDLE hDisk, UINT64 startLba, const GPT_ENTRY entries[128]) {
@@ -223,6 +241,11 @@ BOOLEAN CreateEmptyGpt(HANDLE hDisk, UINT64 totalSectors) {
     if (!WriteGptHeader(hDisk, totalSectors - 1, &backupHeader)) return FALSE;
 
     return TRUE;
+}
+static void MarkBitmapBits(UINT8* bitmap, UINT32 count) {
+    for (UINT32 i = 0; i < count; i++) {
+        bitmap[i / 8] |= (1 << (i % 8));
+    }
 }
 
 BOOLEAN FormatExfat(HANDLE hDisk, UINT64 startLba, UINT64 sectorCount, CHAR16 volumeName[11]) {
@@ -365,7 +388,146 @@ BOOLEAN FormatExfat(HANDLE hDisk, UINT64 startLba, UINT64 sectorCount, CHAR16 vo
     return TRUE;
 }
 
-BOOLEAN AddPartitionToGpt(HANDLE hDisk, const CHAR8* fsType, const char* sizeStr, const wchar_t* partName) {
+BOOLEAN FormatSjfs(HANDLE hDisk, UINT64 startLba, UINT64 sectorCount, UINT8 bands, const CHAR8 *name) {
+    printf("[SJFS] Avvio formattazione a LBA %llu (%llu settori)...\n", startLba, sectorCount);
+
+    UINT32 sectorsPerBlock = BLOCK_SIZE / 512; // 8 settori per blocco (4KB)
+
+    // 1. Azzeramento dei primi 256 settori (128 KB) per pulizia iniziale
+    UINT8 zeroSector[512] = { 0 };
+    for (UINT64 i = 0; i < 256; i++) {
+        if (!WriteSectors(hDisk, startLba + i, 1, zeroSector)) {
+            printf("[SJFS] Errore nella pulizia dei primi settori.\n");
+            return FALSE;
+        }
+    }
+
+    // 2. Validazione dimensione bande (MB)
+    if (bands != 8 && bands != 16 && bands != 32 && bands != 64) {
+        bands = 16; // Default a 64 MB
+    }
+
+    // 3. Configurazione del Superblock
+    UINT8 superBlockBuffer[BLOCK_SIZE];
+    memset(superBlockBuffer, 0, sizeof(superBlockBuffer));
+
+    SUPERBLOCK* supblk = (SUPERBLOCK*)superBlockBuffer;
+    supblk->Magic = SJFS_MAGIC;
+    supblk->Flags = 0;
+    supblk->Status = ALLOK;
+    supblk->BandsFlag = bands;
+    
+    supblk->HashID = Fnv1a64(name);
+    supblk->Wtime = (INT64)GetTimestamp();
+    supblk->Mtime = 0;
+    supblk->BlockSize = BLOCK_SIZE;
+
+    supblk->TotalBlocks = (sectorCount * 512) / BLOCK_SIZE;
+    supblk->JournalStart = 1; // Inizia subito dopo il Superblock
+
+    // WAL Journal: 32 MB di default (max 5% della partizione)
+    UINT64 journalBytes = 32ULL * 1024 * 1024;
+    UINT64 journalBlocks = journalBytes / BLOCK_SIZE;
+    if (journalBlocks > (supblk->TotalBlocks / 20)) {
+        journalBlocks = supblk->TotalBlocks / 20;
+    }
+    supblk->JournalBlocks = journalBlocks;
+
+    supblk->BandSizeInBytes = (UINT64)bands * 1024 * 1024;
+
+    // Offset String Table del Disco
+    supblk->DiskStartTableOffset = 512;
+    supblk->DiskStartTableSize = 1024;
+
+    // 4. Calcolo dimensioni bande e numero blocchi di Header/Bitmap
+    UINT64 journalEndBlock = supblk->JournalStart + supblk->JournalBlocks;
+    UINT64 band0StartLba = startLba + (journalEndBlock * sectorsPerBlock);
+
+    UINT32 blocksPerBand = (UINT32)(supblk->BandSizeInBytes / BLOCK_SIZE);
+    UINT64 usableBlocks = (supblk->TotalBlocks > journalEndBlock) ? (supblk->TotalBlocks - journalEndBlock) : 0;
+    UINT64 totalBands = usableBlocks / blocksPerBand;
+
+    // CALCOLO DINAMICO DIMENSIONE BITMAP:
+    // 1 bit per blocco -> (blocksPerBand + 7) / 8 byte
+    UINT32 bitmapBytes = (blocksPerBand + 7) / 8;
+    UINT32 totalBandHeaderBytes = sizeof(BAND_HEADER) + bitmapBytes;
+    
+    // Quanti blocchi occorrono per contenere Header + Bitmap?
+    UINT32 headerBlocks = (totalBandHeaderBytes + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    UINT32 headerSectors = headerBlocks * sectorsPerBlock;
+
+    // La Root Directory si trova subito dopo i blocchi di Header/Bitmap della Banda 0
+    supblk->RootExtentLba = band0StartLba + headerSectors;
+
+    // Scrittura Superblock (Blocco 0)
+    if (!WriteSectors(hDisk, startLba, sectorsPerBlock, superBlockBuffer)) {
+        printf("[SJFS] Errore durante la scrittura del Superblock!\n");
+        return FALSE;
+    }
+
+    // 5. Inizializzazione di ciascuna Allocation Band
+    printf("[SJFS] Inizializzazione di %llu bande (%u MB ciascuna, Header = %u blocchi)...\n", 
+           totalBands, bands, headerBlocks);
+
+    // Buffer dinamico locale per contenere l'Header esteso della banda (max 32KB per 512MB)
+    UINT8 bandBuffer[32 * 1024]; 
+
+    for (UINT64 i = 0; i < totalBands; i++) {
+        memset(bandBuffer, 0, headerBlocks * BLOCK_SIZE);
+
+        BAND_HEADER* bandHeader = (BAND_HEADER*)bandBuffer;
+        bandHeader->BandIndex = i;
+        bandHeader->TotalBlocks = blocksPerBand;
+        bandHeader->BitmapOffsetBytes = sizeof(BAND_HEADER);
+        
+        UINT64 currentBandStartBlock = journalEndBlock + (i * blocksPerBand);
+        UINT64 currentBandStartLba = startLba + (currentBandStartBlock * sectorsPerBlock);
+        UINT8* bitmap = bandBuffer + bandHeader->BitmapOffsetBytes;
+
+        if (i == 0) {
+            // Banda 0: Occupa gli headerBlocks + 1 blocco per il Nodo Radice della Root Directory
+            bandHeader->CentralDirHead = supblk->RootExtentLba;
+            bandHeader->FreeBlocks = blocksPerBand - (headerBlocks + 1);
+            MarkBitmapBits(bitmap, headerBlocks + 1);
+        } else {
+            // Bande 1..N-1: Occupano solo gli headerBlocks
+            bandHeader->CentralDirHead = 0;
+            bandHeader->FreeBlocks = blocksPerBand - headerBlocks;
+            MarkBitmapBits(bitmap, headerBlocks);
+        }
+
+        if (!WriteSectors(hDisk, currentBandStartLba, headerSectors, bandBuffer)) {
+            printf("[SJFS] Errore scrittura Header della Banda %llu!\n", i);
+            return FALSE;
+        }
+    }
+
+    // 6. Inizializzazione del Nodo Radice del B+Tree (Root Directory /)
+    UINT8 rootNodeBuffer[BLOCK_SIZE];
+    memset(rootNodeBuffer, 0, sizeof(rootNodeBuffer));
+
+    SJFS_BTREE_NODE* rootNode = (SJFS_BTREE_NODE*)rootNodeBuffer;
+    rootNode->NodeType = 0x0001; // Nodo Radice / Foglia
+    rootNode->KeyCount = 0;
+    rootNode->Reserved = 0;
+    rootNode->ParentNodeLba = 0;
+
+    if (!WriteSectors(hDisk, supblk->RootExtentLba, sectorsPerBlock, rootNodeBuffer)) {
+        printf("[SJFS] Errore scrittura Root Directory Node!\n");
+        return FALSE;
+    }
+
+    printf("[SJFS] Formattazione completata con successo!\n");
+    printf("       - Blocchi Totali     : %llu\n", supblk->TotalBlocks);
+    printf("       - Dimensione Band    : %llu MB (%u blocchi/header)\n", 
+           supblk->BandSizeInBytes / (1024 * 1024), headerBlocks);
+    printf("       - Numero Bande       : %llu\n", totalBands);
+    printf("       - Root Directory LBA : %llu\n", supblk->RootExtentLba);
+
+    return TRUE;
+}
+
+BOOLEAN AddPartitionToGpt(HANDLE hDisk, const CHAR8* fsType, const char* sizeStr, const wchar_t* partName, UINT8 bands) {
     UINT32 sectorSize = 0;
     UINT64 totalSectors = 0;
     UINT64 diskSizeBytes = 0;
@@ -438,6 +600,14 @@ BOOLEAN AddPartitionToGpt(HANDLE hDisk, const CHAR8* fsType, const char* sizeStr
             printf("Errore durante la formattazione exFAT della nuova partizione.\n");
             return FALSE;
         }
+    } else if (strcmp(fsType, "sjfs") == 0) {
+        int count = WideCharToMultiByte(CP_ACP, 0, partName, -1, NULL, 0, NULL, NULL);
+        char asciiPartName[count];
+        WideCharToMultiByte(CP_ACP, 0, partName, -1, asciiPartName, count, NULL, NULL);
+        if (!FormatSjfs(hDisk, newStartLba, requestedSectors, bands, (const CHAR8*)asciiPartName)) {
+            printf("Errore durante la formattazione SJFS della nuova partizione.\n");
+            return FALSE;
+        }
     } else {
         printf("File system '%s' non ancora implementato.\n", fsType);
         return FALSE;
@@ -490,6 +660,10 @@ INT32 main() {
     char noOfBytesPerPartition[64];
     char driveSelected = 0;
 
+    printf("====================================================\n");
+    printf("     DFRMT - Disk Partition & SJFS Formatting Tool   \n");
+    printf("====================================================\n");
+
     while (1) {
         printf("\ndfrmt >>> ");
         if (scanf("%63s", cmd) != 1) continue;
@@ -497,7 +671,7 @@ INT32 main() {
         if (strcmp(cmd, "setdisk") == 0) {
             printf("dfrmt >>> [Disk Number] ");
             if (scanf("%63s", disk) == 1) {
-                UINT16 diskNumber = atoi(disk);
+                UINT16 diskNumber = (UINT16)atoi(disk);
                 snprintf(drivePath, sizeof(drivePath), "\\\\.\\PhysicalDrive%d", diskNumber);
                 driveSelected = 1;
                 printf("Disco impostato: %s\n", drivePath);
@@ -512,7 +686,7 @@ INT32 main() {
             printf("dfrmt >>> [Partition Scheme (gpt/mbr)] ");
             scanf("%63s", part); 
             if (strcmp(part, "gpt") != 0 && strcmp(part, "mbr") != 0) {
-                printf("Errore: Tipo partizione non supportato\n");
+                printf("Errore: Tipo partizione non supportato.\n");
                 continue;
             }
             
@@ -539,37 +713,39 @@ INT32 main() {
                 continue;
             }
 
-            printf("[1/3] Pulizia metadati (GPT Primaria e Backup GPT)...\n");
+            printf("[1/2] Pulizia vecchi metadati e creazione nuova tabella GPT...\n");
             BYTE zeroSector[512] = { 0 }; 
 
+            // Azzera GPT Primaria (LBA 0..33)
             for (UINT64 i = 0; i < 34; i++) {
                 WriteSectors(hDisk, i, 1, zeroSector);
             }
 
+            // Azzera GPT di Backup (ultimi 33 settori)
             UINT64 backupStartLba = totalSectors - 33;
             for (UINT64 i = backupStartLba; i < totalSectors; i++) {
                 WriteSectors(hDisk, i, 1, zeroSector);
             }
 
-            DWORD dummy;
-            DeviceIoControl(hDisk, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &dummy, NULL);
-
+            // Scrivi la nuova GPT vuota direttamente
             if (strcmp(part, "gpt") == 0) {
-                printf("[2/3] Inizializzazione Tabella GPT vuota...\n");
                 if (!CreateEmptyGpt(hDisk, totalSectors)) {
                     printf("Errore durante la creazione della GPT.\n");
                     CloseHandle(hDisk);
                     continue;
                 }
             } else if (strcmp(part, "mbr") == 0) {
-                printf("[2/3] unsupported\n");
-                return 0;
+                printf("Errore: MBR non supportato.\n");
+                CloseHandle(hDisk);
+                continue;
             }
 
-            printf("[3/3] Aggiornamento proprietà del disco nel OS...\n");
+            // [2/2] Notifica Windows SOLO adesso che le tabelle sono scritte e valide
+            printf("[2/2] Aggiornamento proprietà del disco nel sistema operativo...\n");
+            DWORD dummy;
             DeviceIoControl(hDisk, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &dummy, NULL);
             
-            printf("\nDisco inizializzato con successo! Ora puoi usare 'addpart' per aggiungere partizioni.\n");
+            printf("\nDisco inizializzato con successo! Ora puoi usare 'addpart'.\n");
             CloseHandle(hDisk);
         }
         else if (strcmp(cmd, "addpart") == 0) { 
@@ -578,11 +754,25 @@ INT32 main() {
                 continue;
             }
 
-            printf("dfrmt >>> [Filesystem] ");
+            printf("dfrmt >>> [Filesystem (exfat/sjfs)] ");
             scanf("%63s", fs);
             if (strcmp(fs, "exfat") != 0 && strcmp(fs, "sjfs") != 0) {
                 printf("Errore: Filesystem non supportato.\n");
                 continue;
+            }
+
+            UINT8 bandSizeMb = 16; // Default per SJFS
+            if (strcmp(fs, "sjfs") == 0) {
+                printf("dfrmt >>> [SJFS Band Size MB (8, 16, 32, 64)] ");
+                char bandBuf[16];
+                if (scanf("%15s", bandBuf) == 1) {
+                    UINT8 val = (UINT8)atoi(bandBuf);
+                    if (val == 8 || val == 16 || val == 32 || val == 64) {
+                        bandSizeMb = val;
+                    } else {
+                        printf("[SJFS] Dimensione banda non valida. Utilizzo del default (64 MB).\n");
+                    }
+                }
             }
 
             printf("dfrmt >>> [Partition Size (es. 500MB, 2GB, MAX)] ");
@@ -601,8 +791,8 @@ INT32 main() {
                 continue;
             }
 
-            if (AddPartitionToGpt(hDisk, fs, noOfBytesPerPartition, wLabel)) {
-                printf("\nPartizione aggiunta e formattata con successo!\n");
+            if (AddPartitionToGpt(hDisk, fs, noOfBytesPerPartition, wLabel, bandSizeMb)) {
+                printf("\nPartizione '%s' aggiunta e formattata con successo!\n", labelBuf);
             } else {
                 printf("\nErrore durante l'aggiunta della partizione.\n");
             }
@@ -610,10 +800,15 @@ INT32 main() {
             CloseHandle(hDisk);
         }
         else if (strcmp(cmd, "exit") == 0) {
+            printf("Uscita da dfrmt...\n");
             return 0;
         }
         else {
-            printf("Comandi disponibili: setdisk, frmtdisk, addpart, exit\n");
+            printf("Comandi disponibili:\n");
+            printf("  setdisk  - Seleziona l'indice del disco fisico\n");
+            printf("  frmtdisk - Inizializza la tabella partizioni (GPT)\n");
+            printf("  addpart  - Aggiunge e formatta una nuova partizione\n");
+            printf("  exit     - Esci dall'utility\n");
         }
     }
 
